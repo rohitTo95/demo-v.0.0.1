@@ -8,7 +8,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from 'http';
-import { Server as SocketIOServer } from 'socket.io';
+import { Server as SocketIOServer, Socket } from 'socket.io';
 import { 
   PageInfo, 
   ClickableElement, 
@@ -21,7 +21,7 @@ class SimpleMCPServer {
   private server: Server;
   private httpServer?: any;
   private io?: SocketIOServer;
-  private nextjsClients: Map<string, any> = new Map();
+  private nextjsClients: Map<string, Socket> = new Map();
 
   constructor() {
     this.server = new Server(
@@ -133,21 +133,9 @@ class SimpleMCPServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       
-      // Get sessionId from args, or use the first available connected client
-      let sessionId = (args as any)?.sessionId;
-      if (!sessionId || !this.nextjsClients.has(sessionId)) {
-        // Use the first available connected client
-        const availableClients = Array.from(this.nextjsClients.keys());
-        console.log(`Available Next.js clients: [${availableClients.join(', ')}]`);
-        
-        if (availableClients.length === 0) {
-          throw new Error('No Next.js clients connected');
-        }
-        sessionId = availableClients[0];
-        console.log(`Using first available client as sessionId: ${sessionId}`);
-      } else {
-        console.log(`Using specified sessionId: ${sessionId}`);
-      }
+      // Get sessionId from args - now optional since we can use best available client
+      const sessionId = (args as any)?.sessionId;
+      console.log(`🎯 [CallTool] Tool: ${name}, SessionId: ${sessionId || 'auto-select'}`);
 
       try {
         let result: any;
@@ -199,23 +187,82 @@ class SimpleMCPServer {
     });
   }
 
-  private async getCurrentPage(sessionId: string): Promise<PageInfo> {
-    console.log(`🔍 [getCurrentPage] Starting for sessionId: ${sessionId}`);
+  /**
+   * Clean up stale connections by testing socket connectivity
+   */
+  private cleanupStaleConnections(): void {
+    console.log('🧹 [CLEANUP] Starting stale connection cleanup...');
+    const staleConnections: string[] = [];
+    
+    for (const [socketId, socket] of this.nextjsClients.entries()) {
+      if (!socket.connected) {
+        console.log(`🗑️ [CLEANUP] Found stale connection: ${socketId} (connected: ${socket.connected})`);
+        staleConnections.push(socketId);
+      }
+    }
+    
+    // Remove stale connections
+    staleConnections.forEach(socketId => {
+      this.nextjsClients.delete(socketId);
+      console.log(`🗑️ [CLEANUP] Removed stale connection: ${socketId}`);
+    });
+    
+    if (staleConnections.length > 0) {
+      console.log(`🧹 [CLEANUP] Cleaned up ${staleConnections.length} stale connections`);
+      console.log(`✅ [CLEANUP] Active clients after cleanup:`, Array.from(this.nextjsClients.keys()));
+    } else {
+      console.log('✅ [CLEANUP] No stale connections found');
+    }
+  }
+
+  /**
+   * Get the best available client (most recently connected)
+   */
+  private getBestAvailableClient(): Socket | null {
+    // Clean up stale connections first
+    this.cleanupStaleConnections();
+    
+    if (this.nextjsClients.size === 0) {
+      console.log('❌ [CLIENT] No clients available');
+      return null;
+    }
+    
+    // Get all connected clients
+    const connectedClients = Array.from(this.nextjsClients.entries())
+      .filter(([_, socket]) => socket.connected)
+      .map(([id, socket]) => ({ id, socket }));
+    
+    if (connectedClients.length === 0) {
+      console.log('❌ [CLIENT] No connected clients available');
+      return null;
+    }
+    
+    // Use the most recently connected client (last in the map)
+    const bestClient = connectedClients[connectedClients.length - 1];
+    console.log(`✅ [CLIENT] Selected best available client: ${bestClient.id}`);
+    console.log(`✅ [CLIENT] Client is connected: ${bestClient.socket.connected}`);
+    
+    return bestClient.socket;
+  }
+
+  private async getCurrentPage(sessionId?: string): Promise<PageInfo> {
+    console.log(`🔍 [getCurrentPage] Starting${sessionId ? ` for sessionId: ${sessionId}` : ' with best available client'}`);
     
     return new Promise((resolve, reject) => {
-      const socket = this.nextjsClients.get(sessionId);
+      const socket = sessionId ? this.nextjsClients.get(sessionId) : this.getBestAvailableClient();
       if (!socket) {
-        console.log(`❌ [getCurrentPage] No Next.js client found for sessionId: ${sessionId}`);
-        console.log(`❌ [getCurrentPage] Available clients:`, Array.from(this.nextjsClients.keys()));
+        const clientsList = Array.from(this.nextjsClients.keys());
+        console.log(`❌ [getCurrentPage] No ${sessionId ? 'matching' : 'available'} Next.js client found`);
+        console.log(`❌ [getCurrentPage] Available clients:`, clientsList);
         reject(new Error('No Next.js client connected'));
         return;
       }
 
-      console.log(`✅ [getCurrentPage] Found client for sessionId: ${sessionId}`);
+      console.log(`✅ [getCurrentPage] Found client: ${socket.id} (connected: ${socket.connected})`);
       console.log(`📤 [getCurrentPage] Emitting 'mcp:getCurrentPage' to client`);
 
       const timeout = setTimeout(() => {
-        console.log(`⏰ [getCurrentPage] Timeout after 5 seconds for sessionId: ${sessionId}`);
+        console.log(`⏰ [getCurrentPage] Timeout after 5 seconds for client: ${socket.id}`);
         reject(new Error('Timeout'));
       }, 5000);
 
@@ -231,23 +278,24 @@ class SimpleMCPServer {
     });
   }
 
-  private async getClickableElements(sessionId: string): Promise<ClickableElement[]> {
-    console.log(`🔍 [getClickableElements] Starting for sessionId: ${sessionId}`);
+  private async getClickableElements(sessionId?: string): Promise<ClickableElement[]> {
+    console.log(`🔍 [getClickableElements] Starting${sessionId ? ` for sessionId: ${sessionId}` : ' with best available client'}`);
     
     return new Promise((resolve, reject) => {
-      const socket = this.nextjsClients.get(sessionId);
+      const socket = sessionId ? this.nextjsClients.get(sessionId) : this.getBestAvailableClient();
       if (!socket) {
-        console.log(`❌ [getClickableElements] No Next.js client found for sessionId: ${sessionId}`);
-        console.log(`❌ [getClickableElements] Available clients:`, Array.from(this.nextjsClients.keys()));
+        const clientsList = Array.from(this.nextjsClients.keys());
+        console.log(`❌ [getClickableElements] No ${sessionId ? 'matching' : 'available'} Next.js client found`);
+        console.log(`❌ [getClickableElements] Available clients:`, clientsList);
         reject(new Error('No Next.js client connected'));
         return;
       }
 
-      console.log(`✅ [getClickableElements] Found client for sessionId: ${sessionId}`);
+      console.log(`✅ [getClickableElements] Found client: ${socket.id} (connected: ${socket.connected})`);
       console.log(`📤 [getClickableElements] Emitting 'mcp:getClickableElements' to client`);
 
       const timeout = setTimeout(() => {
-        console.log(`⏰ [getClickableElements] Timeout after 5 seconds for sessionId: ${sessionId}`);
+        console.log(`⏰ [getClickableElements] Timeout after 5 seconds for client: ${socket.id}`);
         reject(new Error('Timeout'));
       }, 5000);
 
@@ -264,23 +312,24 @@ class SimpleMCPServer {
     });
   }
 
-  private async clickElement(sessionId: string, elementName: string): Promise<ClickResult> {
-    console.log(`🖱️ [clickElement] Starting for sessionId: ${sessionId}, element: ${elementName}`);
+  private async clickElement(sessionId: string | undefined, elementName: string): Promise<ClickResult> {
+    console.log(`🖱️ [clickElement] Starting${sessionId ? ` for sessionId: ${sessionId}` : ' with best available client'}, element: ${elementName}`);
     
     return new Promise((resolve, reject) => {
-      const socket = this.nextjsClients.get(sessionId);
+      const socket = sessionId ? this.nextjsClients.get(sessionId) : this.getBestAvailableClient();
       if (!socket) {
-        console.log(`❌ [clickElement] No Next.js client found for sessionId: ${sessionId}`);
-        console.log(`❌ [clickElement] Available clients:`, Array.from(this.nextjsClients.keys()));
+        const clientsList = Array.from(this.nextjsClients.keys());
+        console.log(`❌ [clickElement] No ${sessionId ? 'matching' : 'available'} Next.js client found`);
+        console.log(`❌ [clickElement] Available clients:`, clientsList);
         reject(new Error('No Next.js client connected'));
         return;
       }
 
-      console.log(`✅ [clickElement] Found client for sessionId: ${sessionId}`);
+      console.log(`✅ [clickElement] Found client: ${socket.id} (connected: ${socket.connected})`);
       console.log(`📤 [clickElement] Emitting 'mcp:clickElement' to client with elementName: ${elementName}`);
 
       const timeout = setTimeout(() => {
-        console.log(`⏰ [clickElement] Timeout after 10 seconds for sessionId: ${sessionId}, element: ${elementName}`);
+        console.log(`⏰ [clickElement] Timeout after 10 seconds for client: ${socket.id}, element: ${elementName}`);
         reject(new Error('Timeout'));
       }, 10000);
 
@@ -296,23 +345,24 @@ class SimpleMCPServer {
     });
   }
 
-  private async navigatePage(sessionId: string, page: string): Promise<NavigationResult> {
-    console.log(`🧭 [navigatePage] Starting for sessionId: ${sessionId}, page: ${page}`);
+  private async navigatePage(sessionId: string | undefined, page: string): Promise<NavigationResult> {
+    console.log(`🧭 [navigatePage] Starting${sessionId ? ` for sessionId: ${sessionId}` : ' with best available client'}, page: ${page}`);
     
     return new Promise((resolve, reject) => {
-      const socket = this.nextjsClients.get(sessionId);
+      const socket = sessionId ? this.nextjsClients.get(sessionId) : this.getBestAvailableClient();
       if (!socket) {
-        console.log(`❌ [navigatePage] No Next.js client found for sessionId: ${sessionId}`);
-        console.log(`❌ [navigatePage] Available clients:`, Array.from(this.nextjsClients.keys()));
+        const clientsList = Array.from(this.nextjsClients.keys());
+        console.log(`❌ [navigatePage] No ${sessionId ? 'matching' : 'available'} Next.js client found`);
+        console.log(`❌ [navigatePage] Available clients:`, clientsList);
         reject(new Error('No Next.js client connected'));
         return;
       }
 
-      console.log(`✅ [navigatePage] Found client for sessionId: ${sessionId}`);
+      console.log(`✅ [navigatePage] Found client: ${socket.id} (connected: ${socket.connected})`);
       console.log(`📤 [navigatePage] Emitting 'mcp:navigatePage' to client with page: ${page}`);
 
       const timeout = setTimeout(() => {
-        console.log(`⏰ [navigatePage] Timeout after 10 seconds for sessionId: ${sessionId}, page: ${page}`);
+        console.log(`⏰ [navigatePage] Timeout after 10 seconds for client: ${socket.id}, page: ${page}`);
         reject(new Error('Timeout'));
       }, 10000);
 
@@ -328,23 +378,24 @@ class SimpleMCPServer {
     });
   }
 
-  private async fillBookingForm(sessionId: string, formData: any): Promise<BookingFormResult> {
-    console.log(`📝 [fillBookingForm] Starting for sessionId: ${sessionId}, formData:`, formData);
+  private async fillBookingForm(sessionId: string | undefined, formData: any): Promise<BookingFormResult> {
+    console.log(`📝 [fillBookingForm] Starting${sessionId ? ` for sessionId: ${sessionId}` : ' with best available client'}, formData:`, formData);
     
     return new Promise((resolve, reject) => {
-      const socket = this.nextjsClients.get(sessionId);
+      const socket = sessionId ? this.nextjsClients.get(sessionId) : this.getBestAvailableClient();
       if (!socket) {
-        console.log(`❌ [fillBookingForm] No Next.js client found for sessionId: ${sessionId}`);
-        console.log(`❌ [fillBookingForm] Available clients:`, Array.from(this.nextjsClients.keys()));
+        const clientsList = Array.from(this.nextjsClients.keys());
+        console.log(`❌ [fillBookingForm] No ${sessionId ? 'matching' : 'available'} Next.js client found`);
+        console.log(`❌ [fillBookingForm] Available clients:`, clientsList);
         reject(new Error('No Next.js client connected'));
         return;
       }
 
-      console.log(`✅ [fillBookingForm] Found client for sessionId: ${sessionId}`);
+      console.log(`✅ [fillBookingForm] Found client: ${socket.id} (connected: ${socket.connected})`);
       console.log(`📤 [fillBookingForm] Emitting 'mcp:fillBookingForm' to client with formData:`, formData);
 
       const timeout = setTimeout(() => {
-        console.log(`⏰ [fillBookingForm] Timeout after 15 seconds for sessionId: ${sessionId}`);
+        console.log(`⏰ [fillBookingForm] Timeout after 15 seconds for client: ${socket.id}`);
         reject(new Error('Timeout'));
       }, 15000);
 
@@ -366,10 +417,141 @@ class SimpleMCPServer {
   }
 
   async startHttp(port: number = 3001): Promise<void> {
-    this.httpServer = createServer();
+    this.httpServer = createServer((req, res) => {
+      // Set CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'healthy',
+          server: 'MCP Server',
+          timestamp: new Date().toISOString(),
+          connectedClients: Array.from(this.nextjsClients.keys()),
+          clientCount: this.nextjsClients.size
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/mcp') {
+        let body = '';
+        req.on('data', chunk => {
+          body += chunk.toString();
+        });
+
+        req.on('end', async () => {
+          try {
+            const request = JSON.parse(body);
+            console.log('📨 [HTTP] Received MCP request:', request);
+
+            if (request.method === 'tools/list') {
+              const tools = [
+                { name: 'getCurrentPage', description: 'Get current page information' },
+                { name: 'getClickableElements', description: 'Get clickable elements on current page' },
+                { name: 'clickElement', description: 'Click a named element' },
+                { name: 'navigatePage', description: 'Navigate to a page' },
+                { name: 'fillBookingForm', description: 'Fill booking form' }
+              ];
+
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                jsonrpc: '2.0',
+                id: request.id,
+                result: { tools }
+              }));
+              return;
+            }
+
+            if (request.method === 'tools/call') {
+              const { name, arguments: args } = request.params;
+              console.log(`🎯 [HTTP] Tool call: ${name}`, args);
+
+              let result: any;
+              try {
+                switch (name) {
+                  case 'getCurrentPage':
+                    result = await this.getCurrentPage(args?.sessionId);
+                    break;
+                  case 'getClickableElements':
+                    result = await this.getClickableElements(args?.sessionId);
+                    break;
+                  case 'clickElement':
+                    result = await this.clickElement(args?.sessionId, args?.name);
+                    break;
+                  case 'navigatePage':
+                    result = await this.navigatePage(args?.sessionId, args?.page);
+                    break;
+                  case 'fillBookingForm':
+                    result = await this.fillBookingForm(args?.sessionId, args);
+                    break;
+                  default:
+                    throw new Error(`Unknown tool: ${name}`);
+                }
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: request.id,
+                  result: {
+                    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+                  }
+                }));
+              } catch (error) {
+                console.error('❌ [HTTP] Tool execution error:', error);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: request.id,
+                  error: {
+                    code: -32603,
+                    message: error instanceof Error ? error.message : 'Internal error',
+                    data: { tool: name, args }
+                  }
+                }));
+              }
+              return;
+            }
+
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              id: request.id,
+              error: { code: -32601, message: 'Method not found' }
+            }));
+
+          } catch (error) {
+            console.error('❌ [HTTP] Request parsing error:', error);
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: 'Parse error' }
+            }));
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+    });
+
     this.io = new SocketIOServer(this.httpServer, {
       cors: { origin: "*", methods: ["GET", "POST"] }
     });
+
+    // Start periodic cleanup of stale connections
+    setInterval(() => {
+      this.cleanupStaleConnections();
+    }, 30000); // Clean up every 30 seconds
 
     // Handle main namespace connections
     this.io.on('connection', (socket) => {
